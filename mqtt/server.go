@@ -1,226 +1,219 @@
 package mqtt
 
 import (
+	"crypto/tls"
+	"errors"
 	"io"
-	"log"
 	"net"
 	"strings"
-
-	"github.com/j-forster/mqtt/tools"
 )
 
-type SubscriptionRequest struct {
-	subs  *Subscription
-	topic string
+type Reciever interface {
+	Publish(client *Client, msg *Message) error
+}
+
+type Authenticator interface {
+	Authenticate(client *Client, auth *ConnectAuth) byte
 }
 
 const (
-	CREATE = 1
-	REMOVE = 2
+	actionCreate = 1
+	actionRemove = 2
 )
 
-type SubscriptionChange struct {
+type subscriptionChange struct {
 	action int
 	subs   *Subscription
 	topic  string
 }
 
-type Server struct {
-
-	//subsReq chan SubscriptionRequest
-	//unsubs chan *Subscription
-	state    int
-	closer   io.Closer
-	sigclose chan (struct{})
-	subs     chan SubscriptionChange
-	pub      chan *Message
-	topics   *Topic
-	handler  Handler
-	debug    bool
+type publication struct {
+	sender *Client
+	msg    *Message
 }
 
-func NewServer(closer io.Closer, handler Handler) *Server {
-
-	svr := new(Server)
-	//svr.subsReq = make(chan SubscriptionRequest)
-	//svr.unsubs = make(chan *Subscription)
-	svr.closer = closer
-	svr.handler = handler
-	svr.sigclose = make(chan struct{})
-	svr.subs = make(chan SubscriptionChange)
-	svr.pub = make(chan *Message)
-	svr.topics = NewTopic(nil, "")
-	return svr
+// The DefaultServer is as MQTT Server implementation with topics, subscriptions and all that.
+// It will accept all clients, so use the Auth interface for custom permission checking.
+type DefaultServer struct {
+	sigclose  chan (struct{})
+	subsQueue chan subscriptionChange
+	pubQueue  chan publication
+	// Use a custom Authenticator to check each client for permissions.
+	Auth Authenticator
+	// The topics tree, holding all the subscriptions.
+	Topics *Topic
 }
 
-func (svr *Server) SetDebug(debug bool) {
-
-	svr.debug = debug
+// An interface for use as a MQTT server, that can recieve Publish-Messages,
+// authenticate clients and manage subscriptions and unsubscriptions.
+type Server interface {
+	Reciever
+	Connect(client *Client, auth *ConnectAuth) byte
+	Disconnect(client *Client, err error)
+	Subscribe(recv Reciever, topic string, qos byte) *Subscription
+	Unsubscribe(subs *Subscription)
 }
 
-func (svr *Server) Alive() bool {
+// Create a new MQTT server.
+func NewServer() *DefaultServer {
+	server := &DefaultServer{
+		sigclose:  make(chan struct{}),
+		subsQueue: make(chan subscriptionChange),
+		pubQueue:  make(chan publication),
+		Topics:    NewTopic(nil, ""),
+	}
 
-	return svr.state != CLOSING && svr.state != CLOSED
+	go server.schedule()
+	return server
 }
 
-func (svr *Server) Publish(conn *Connection, msg *Message) {
-
-	if !svr.Alive() {
-		return
-	}
-
-	var err error = nil
-	if svr.handler != nil {
-		err = svr.handler.Publish(conn, msg)
-	}
-	if err == nil {
-
-		svr.pub <- msg
-	}
-}
-
-func (svr *Server) Subscribe(conn *Connection, topic string, qos byte) *Subscription {
-
-	if !svr.Alive() {
-		return nil
-	}
-
-	var err error = nil
-	if svr.handler != nil {
-		err = svr.handler.Subscribe(conn, topic, qos)
-	}
-	if err == nil {
-
-		subs := NewSubscription(conn, qos)
-		svr.subs <- SubscriptionChange{CREATE, subs, topic}
-		return subs
-	}
+func (server *DefaultServer) Publish(client *Client, msg *Message) error {
+	server.pubQueue <- publication{client, msg}
 	return nil
 }
 
-func (svr *Server) Unsubscribe(subs *Subscription) {
-
-	if !svr.Alive() {
-		return
+func (server *DefaultServer) Connect(client *Client, auth *ConnectAuth) byte {
+	if server.Auth != nil {
+		return server.Auth.Authenticate(client, auth)
 	}
-
-	svr.subs <- SubscriptionChange{REMOVE, subs, ""}
+	return CodeAccepted
 }
 
-func (svr *Server) Run() {
+func (server *DefaultServer) Disconnect(client *Client, err error) {
+}
+
+func (server *DefaultServer) Subscribe(recv Reciever, topic string, qos byte) *Subscription {
+
+	subs := NewSubscription(recv, qos)
+	server.subsQueue <- subscriptionChange{actionCreate, subs, topic}
+	return subs
+}
+
+func (server *DefaultServer) Unsubscribe(subs *Subscription) {
+
+	server.subsQueue <- subscriptionChange{actionRemove, subs, ""}
+}
+
+func (server *DefaultServer) Close() {
+
+	close(server.sigclose)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+type closer interface {
+	Close(err error)
+}
+
+var serverClosed = errors.New("Server closed.")
+
+func (server *DefaultServer) schedule() {
 
 RUN:
 	for {
 		select {
-		case <-svr.sigclose:
+		case <-server.sigclose:
 
-			close(svr.subs)
-			close(svr.pub)
+			close(server.subsQueue)
+			close(server.pubQueue)
 
 			SYSALL := []string{"$SYS", "all"}
-			subs := svr.topics.Find(SYSALL)
-			for ; subs != nil; subs = subs.next {
-
-				subs.conn.Close()
+			subs := server.Topics.Find(SYSALL)
+			for ; subs != nil; subs = subs.Next {
+				if closer, ok := subs.Recv.(closer); ok {
+					closer.Close(serverClosed)
+				}
 			}
 
-			svr.state = CLOSED
 			break RUN
 
-		case evt := <-svr.subs:
+		case evt := <-server.subsQueue:
 
 			switch evt.action {
-			case CREATE:
-				svr.topics.Subscribe(strings.Split(evt.topic, "/"), evt.subs)
+			case actionCreate:
+				server.Topics.Subscribe(strings.Split(evt.topic, "/"), evt.subs)
 
-			case REMOVE:
+			case actionRemove:
 				evt.subs.Unsubscribe()
 			}
 
-			log.Println("[DEBUG] Topics:", svr.topics)
+			// log.Println("[DEBUG] Topics:", server.Topics)
 
-		case msg := <-svr.pub:
+		case pub := <-server.pubQueue:
 
-			if msg.Topic == "$SYS/close" {
-				// svr.Close()
-
-			} else {
-
-				n := len(msg.Buf)
-				if n > 30 {
-					n = 30
-				}
-
-				if svr.debug {
-					log.Printf("[DEBUG] Publish: %q: %q", msg.Topic, string(msg.Buf[:n]))
-				}
-				svr.topics.Publish(strings.Split(msg.Topic, "/"), msg)
+			if strings.HasPrefix(pub.msg.Topic, "$SYS/") {
+				// we don't do that here..
+				return
 			}
+
+			n := len(pub.msg.Data)
+			if n > 30 {
+				n = 30
+			}
+
+			//if svr.debug {
+			//	log.Printf("[DEBUG] Publish: %q: %q", msg.Topic, string(msg.Buf[:n]))
+			//}
+			topic := strings.Split(pub.msg.Topic, "/")
+			server.Topics.Publish(topic, pub.sender, pub.msg)
 		}
 	}
 }
 
-func (svr *Server) Close() {
+////////////////////////////////////////////////////////////////////////////////
 
-	if svr.Alive() {
+func ListenAndServe(addr string, server Server) error {
 
-		close(svr.sigclose)
-		svr.state = CLOSING
-		if svr.closer != nil {
-			svr.closer.Close()
-		}
-	}
-}
-
-func (svr *Server) Serve(rwc io.ReadWriteCloser) {
-
-	// uconn := tools.Unblock(rwc)
-
-	conn := NewConnection(rwc, rwc, svr)
-	defer conn.Close()
-
-	// conn.Subscribe("$SYS/all", 0)
-
-	for conn.Alive() {
-		conn.Read(rwc)
-	}
-}
-
-func Join(conn net.Conn, server *Server) {
-
-	uconn := tools.Unblock(conn)
-
-	wsconn := NewConnection(uconn, uconn, server)
-	defer wsconn.Close()
-
-	wsconn.Subscribe("$SYS/all", 0)
-
-	for wsconn.Alive() {
-		wsconn.Read(conn)
-	}
-}
-
-func ListenAndServe(addr string, handler Handler) error {
-
-	tcp, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
-	server := NewServer(tcp, handler)
-	go server.Run()
+	return serve(listener, server)
+}
+
+func ListenAndServeTLS(addr string, config *tls.Config, server Server) error {
+
+	listener, err := tls.Listen("tcp", addr, config)
+	if err != nil {
+		return err
+	}
+
+	return serve(listener, server)
+}
+
+func serve(listener net.Listener, server Server) error {
+
+	if server == nil {
+		server = NewServer()
+	}
 
 	for {
-
-		conn, err := tcp.Accept()
+		conn, err := listener.Accept()
 		if err == nil {
-
-			go server.Serve(conn)
+			Serve(conn, server)
 		} else {
-
 			return err
 		}
 	}
 
 	return nil
+}
+
+func Serve(stream io.ReadWriteCloser, server Server) {
+
+	if server == nil {
+		server = NewServer()
+	}
+
+	client := &Client{
+		pending: make(map[int]Packet),
+		queue:   make(chan Packet),
+		Closer:  stream,
+		Server:  server,
+		subs:    make(map[string]*Subscription),
+		State:   StateConnecting,
+	}
+	go client.serveReader(stream)
+	go client.serveWriter(stream)
 }

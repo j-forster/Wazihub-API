@@ -8,112 +8,112 @@ import (
 ///////////////////////////////////////////////////////////////////////////////
 
 type Subscription struct {
-	conn *Connection
+	Recv Reciever
 	// topic string
-	topic *Topic
+	Topic *Topic
 
-	qos byte
+	QoS byte
 
-	next, prev *Subscription
+	Next, Prev *Subscription
 }
 
-func NewSubscription(conn *Connection, qos byte) *Subscription {
-	sub := new(Subscription)
-	sub.conn = conn
-	sub.qos = qos
-	return sub
+func NewSubscription(recv Reciever, qos byte) *Subscription {
+	return &Subscription{
+		Recv: recv,
+		QoS:  qos,
+	}
 }
 
-func (s *Subscription) Publish(msg *Message) {
+func (s *Subscription) Publish(client *Client, msg *Message) {
 
 	if s == nil {
 		return
 	}
 
-	s.conn.Publish(s, msg)
+	s.Recv.Publish(client, msg)
 
-	s.next.Publish(msg)
+	s.Next.Publish(client, msg)
 }
 
 func (s *Subscription) ChainLength() int {
 	if s == nil {
 		return 0
 	}
-	return s.next.ChainLength() + 1
+	return s.Next.ChainLength() + 1
 }
 
 func (sub *Subscription) Unsubscribe() {
 
-	topic := sub.topic
+	topic := sub.Topic
 
 	if topic == nil {
 		return
 	}
 
-	if sub.prev == nil {
-		if topic.subs == sub {
-			topic.subs = sub.next
+	if sub.Prev == nil {
+		if topic.Subs == sub {
+			topic.Subs = sub.Next
 		} else {
-			topic.mlwcSubs = sub.next
+			topic.MLWCSubs = sub.Next
 		}
 
-		if sub.next != nil {
-			sub.next.prev = nil
+		if sub.Next != nil {
+			sub.Next.Prev = nil
 		}
 
 		// the topic we unsubscribed can be removed if
-		if topic.subs == nil && // no subscribers
-			topic.retainMsg == nil && // no retrain message
-			topic.mlwcSubs == nil && // no /# subscribers
-			topic.wcTopic == nil && // no /+ topic
-			len(topic.children) == 0 { // no sub-topics
+		if topic.Subs == nil && // no subscribers
+			topic.RetainMsg == nil && // no retrain message
+			topic.MLWCSubs == nil && // no /# subscribers
+			topic.WCTopic == nil && // no /+ topic
+			len(topic.Children) == 0 { // no sub-topics
 			topic.Remove()
 		}
 	} else {
-		sub.prev.next = sub.next
-		if sub.next != nil {
-			sub.next.prev = sub.prev
+		sub.Prev.Next = sub.Next
+		if sub.Next != nil {
+			sub.Next.Prev = sub.Prev
 		}
 	}
 
-	sub.topic = nil
+	sub.Topic = nil
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
 type Topic struct {
 	// topic name like "b" in 'a/b' for b
-	name string
+	Name string
 	// any sub topic like /b in 'a/b' for a
-	children map[string]*Topic
+	Children map[string]*Topic
 	// wildcard (+) topic
-	wcTopic *Topic
+	WCTopic *Topic
 	// parent topic like a in 'a/b' for b
-	parent *Topic
+	Parent *Topic
 	// all subscriptions to this topic (double linked list)
-	subs *Subscription
+	Subs *Subscription
 	// all subscriptions to /# (multi level wildcard)
-	mlwcSubs *Subscription
+	MLWCSubs *Subscription
 	// retain message
-	retainMsg *Message
+	RetainMsg *Message
 }
 
 func NewTopic(parent *Topic, name string) *Topic {
-	t := new(Topic)
-	t.children = make(map[string]*Topic)
-	t.parent = parent
-	t.name = name
-	return t
+	return &Topic{
+		Children: make(map[string]*Topic),
+		Parent:   parent,
+		Name:     name,
+	}
 }
 
 func (topic *Topic) Find(s []string) *Subscription {
 
 	if len(s) == 0 {
 
-		return topic.subs
+		return topic.Subs
 	} else {
 
-		t, ok := topic.children[s[0]]
+		t, ok := topic.Children[s[0]]
 		if ok {
 			return t.Find(s[1:])
 		}
@@ -121,27 +121,27 @@ func (topic *Topic) Find(s []string) *Subscription {
 	return nil
 }
 
-func (topic *Topic) Publish(s []string, msg *Message) {
+func (topic *Topic) Publish(s []string, client *Client, msg *Message) {
 
 	if len(s) == 0 {
 
 		// len() = 0 means we are at the end of the topics-tree
 		// and inform all subscribers here
-		topic.subs.Publish(msg)
+		topic.Subs.Publish(client, msg)
 
 		// attach retain message to the topic
-		if msg.retain {
-			topic.retainMsg = msg
+		if msg.Retain {
+			topic.RetainMsg = msg
 		}
 	} else {
 
 		// search for the child note
-		t, ok := topic.children[s[0]]
+		t, ok := topic.Children[s[0]]
 		if ok {
-			t.Publish(s[1:], msg)
+			t.Publish(s[1:], client, msg)
 		} else {
 
-			if msg.retain {
+			if msg.Retain {
 				// retain messages are attached to a topic
 				// se we need to create the topic as it does not exist
 				t.Subscribe(s[1:], nil)
@@ -149,35 +149,35 @@ func (topic *Topic) Publish(s []string, msg *Message) {
 		}
 
 		// notify all ../+ subscribers
-		if topic.wcTopic != nil {
-			topic.wcTopic.Publish(s[1:], msg)
+		if topic.WCTopic != nil {
+			topic.WCTopic.Publish(s[1:], client, msg)
 		}
 	}
 
 	// the /# subscribers always match
-	topic.mlwcSubs.Publish(msg)
+	topic.MLWCSubs.Publish(client, msg)
 }
 
 func (topic *Topic) FullName() string {
-	if topic.parent != nil {
-		return topic.parent.FullName() + "/" + topic.name
+	if topic.Parent != nil {
+		return topic.Parent.FullName() + "/" + topic.Name
 	} else {
-		return topic.name
+		return topic.Name
 	}
 }
 
 func (topic *Topic) String() string {
 
 	var builder strings.Builder
-	if n := topic.subs.ChainLength(); n != 0 {
+	if n := topic.Subs.ChainLength(); n != 0 {
 		builder.WriteString("\n/ (" + strconv.Itoa(n) + " listeners)\n")
 	}
-	if n := topic.mlwcSubs.ChainLength(); n != 0 {
+	if n := topic.MLWCSubs.ChainLength(); n != 0 {
 		builder.WriteString("\n/# (" + strconv.Itoa(n) + " listeners)\n")
 	}
 
-	for sub, topic := range topic.children {
-		builder.WriteString("\n" + sub + " (" + strconv.Itoa(topic.subs.ChainLength()) + " listeners)")
+	for sub, topic := range topic.Children {
+		builder.WriteString("\n" + sub + " (" + strconv.Itoa(topic.Subs.ChainLength()) + " listeners)")
 		topic.PrintIndent(&builder, "  ")
 	}
 	return builder.String()
@@ -185,48 +185,48 @@ func (topic *Topic) String() string {
 
 func (topic *Topic) PrintIndent(builder *strings.Builder, indent string) {
 
-	if n := topic.mlwcSubs.ChainLength(); n != 0 {
+	if n := topic.MLWCSubs.ChainLength(); n != 0 {
 		builder.WriteString("\n" + indent + "/# (" + strconv.Itoa(n) + " listeners)")
 	}
 
-	if topic.wcTopic != nil {
+	if topic.WCTopic != nil {
 
-		builder.WriteString("\n" + indent + "/+ (" + strconv.Itoa(topic.wcTopic.subs.ChainLength()) + " listeners)")
-		topic.wcTopic.PrintIndent(builder, indent+"  ")
+		builder.WriteString("\n" + indent + "/+ (" + strconv.Itoa(topic.WCTopic.Subs.ChainLength()) + " listeners)")
+		topic.WCTopic.PrintIndent(builder, indent+"  ")
 	}
 
-	for sub, t := range topic.children {
-		builder.WriteString("\n" + indent + "/" + sub + " (" + strconv.Itoa(t.subs.ChainLength()) + " listeners)")
+	for sub, t := range topic.Children {
+		builder.WriteString("\n" + indent + "/" + sub + " (" + strconv.Itoa(t.Subs.ChainLength()) + " listeners)")
 		t.PrintIndent(builder, indent+"  ")
 	}
 }
 
 func (topic *Topic) Enqueue(queue **Subscription, s *Subscription) {
 
-	s.prev = nil
-	s.next = *queue
+	s.Prev = nil
+	s.Next = *queue
 
-	if s.next != nil {
-		s.next.prev = s
+	if s.Next != nil {
+		s.Next.Prev = s
 	}
 	*queue = s
 
-	s.topic = topic
+	s.Topic = topic
 }
 
 func (topic *Topic) Subscribe(t []string, sub *Subscription) {
 
 	if len(t) == 0 {
 
-		topic.Enqueue(&topic.subs, sub)
-		if topic.retainMsg != nil {
-			sub.conn.Publish(sub, topic.retainMsg)
+		topic.Enqueue(&topic.Subs, sub)
+		if topic.RetainMsg != nil {
+			sub.Recv.Publish(nil, topic.RetainMsg)
 		}
 
 	} else {
 
 		if t[0] == "#" {
-			topic.Enqueue(&topic.mlwcSubs, sub)
+			topic.Enqueue(&topic.MLWCSubs, sub)
 			return
 		}
 
@@ -235,15 +235,15 @@ func (topic *Topic) Subscribe(t []string, sub *Subscription) {
 
 		if t[0] == "+" {
 
-			if topic.wcTopic == nil {
-				topic.wcTopic = NewTopic(topic, "+")
+			if topic.WCTopic == nil {
+				topic.WCTopic = NewTopic(topic, "+")
 			}
-			child = topic.wcTopic
+			child = topic.WCTopic
 		} else {
-			child, ok = topic.children[t[0]]
+			child, ok = topic.Children[t[0]]
 			if !ok {
 				child = NewTopic(topic, t[0])
-				topic.children[t[0]] = child
+				topic.Children[t[0]] = child
 			}
 		}
 
@@ -253,42 +253,42 @@ func (topic *Topic) Subscribe(t []string, sub *Subscription) {
 
 func (topic *Topic) Remove() {
 
-	parent := topic.parent
+	parent := topic.Parent
 
 	if parent != nil {
 
 		// the wildcard topic is attached different to the parent topic
-		if topic.name == "+" {
+		if topic.Name == "+" {
 
 			// also the parent topic if
-			if len(parent.children) == 0 && // no sub-topics
-				parent.retainMsg == nil && // no retain message
-				parent.subs == nil && // no subscriptions
-				parent.mlwcSubs == nil && // no /# subscriptions
-				parent.parent != nil { // but not the root topic :)
+			if len(parent.Children) == 0 && // no sub-topics
+				parent.RetainMsg == nil && // no retain message
+				parent.Subs == nil && // no subscriptions
+				parent.MLWCSubs == nil && // no /# subscriptions
+				parent.Parent != nil { // but not the root topic :)
 
 				parent.Remove()
 				return
 			}
 
 			// remove this wildcard topic
-			parent.wcTopic = nil
+			parent.WCTopic = nil
 			return
 		}
 
 		// also the parent topic if
-		if parent.wcTopic == nil && // no /+ subscribers
-			parent.retainMsg == nil && // no retain message
-			parent.mlwcSubs == nil && // no /# subscribers
-			len(parent.children) == 1 && // no sub-topics (just this one)
-			parent.subs == nil && // no subscriptions
-			parent.parent != nil { // but not the root topic
+		if parent.WCTopic == nil && // no /+ subscribers
+			parent.RetainMsg == nil && // no retain message
+			parent.MLWCSubs == nil && // no /# subscribers
+			len(parent.Children) == 1 && // no sub-topics (just this one)
+			parent.Subs == nil && // no subscriptions
+			parent.Parent != nil { // but not the root topic
 
 			parent.Remove()
 			return
 		}
 
 		// remove this topic from the parents sub-topics
-		delete(parent.children, topic.name)
+		delete(parent.Children, topic.Name)
 	}
 }
