@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +33,8 @@ type Client struct {
 	// It will be closed when the client disconnects.
 	io.Closer
 	//
+	Context context.Context
+
 	State int
 
 	queue   chan Packet
@@ -60,6 +63,7 @@ func Dial(addr string, clientId string, auth *ConnectAuth, will *Message) (*Clie
 	if err != nil {
 		return nil, err
 	}
+	client.Context = context.Background()
 	client.Closer = conn
 
 	connect := Connect("MQIsdp", byte(0x03), true, 5000, clientId, will, auth)

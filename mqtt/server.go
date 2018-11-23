@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -213,6 +214,7 @@ func Serve(stream io.ReadWriteCloser, server Server) {
 		Server:  server,
 		subs:    make(map[string]*Subscription),
 		State:   StateConnecting,
+		Context: context.Background(),
 	}
 	go client.serveReader(stream)
 	go client.serveWriter(stream)
