@@ -33,12 +33,20 @@ type publication struct {
 	msg    *Message
 }
 
+type connection struct {
+	stream io.ReadWriteCloser
+	packet *ConnectPacket
+	server Server
+}
+
 // The DefaultServer is as MQTT Server implementation with topics, subscriptions and all that.
 // It will accept all clients, so use the Auth interface for custom permission checking.
 type DefaultServer struct {
-	sigclose  chan (struct{})
-	subsQueue chan subscriptionChange
-	pubQueue  chan publication
+	sigclose     chan (struct{})
+	subsQueue    chan subscriptionChange
+	pubQueue     chan publication
+	connectQueue chan connection
+
 	// Use a custom Authenticator to check each client for permissions.
 	Auth Authenticator
 	// The topics tree, holding all the subscriptions.
@@ -50,6 +58,7 @@ type DefaultServer struct {
 type Server interface {
 	Reciever
 	Connect(client *Client, auth *ConnectAuth) byte
+	PreConnect(stream io.ReadWriteCloser, connect *ConnectPacket, server Server)
 	Disconnect(client *Client, err error)
 	Subscribe(recv Reciever, topic string, qos byte) *Subscription
 	Unsubscribe(subs *Subscription)
@@ -58,10 +67,11 @@ type Server interface {
 // Create a new MQTT server.
 func NewServer() *DefaultServer {
 	server := &DefaultServer{
-		sigclose:  make(chan struct{}),
-		subsQueue: make(chan subscriptionChange),
-		pubQueue:  make(chan publication),
-		Topics:    NewTopic(nil, ""),
+		sigclose:     make(chan struct{}),
+		subsQueue:    make(chan subscriptionChange),
+		pubQueue:     make(chan publication),
+		connectQueue: make(chan connection),
+		Topics:       NewTopic(nil, ""),
 	}
 
 	go server.schedule()
@@ -78,6 +88,10 @@ func (server *DefaultServer) Connect(client *Client, auth *ConnectAuth) byte {
 		return server.Auth.Authenticate(client, auth)
 	}
 	return CodeAccepted
+}
+
+func (server *DefaultServer) PreConnect(stream io.ReadWriteCloser, connect *ConnectPacket, s Server) {
+	server.connectQueue <- connection{stream, connect, s}
 }
 
 func (server *DefaultServer) Disconnect(client *Client, err error) {
@@ -117,12 +131,12 @@ RUN:
 
 			close(server.subsQueue)
 			close(server.pubQueue)
+			close(server.connectQueue)
 
-			SYSALL := []string{"$SYS", "all"}
-			subs := server.Topics.Find(SYSALL)
+			subs := server.Topics.Find([]string{"$SYS", "all"})
 			for ; subs != nil; subs = subs.Next {
-				if closer, ok := subs.Recv.(closer); ok {
-					closer.Close(serverClosed)
+				if c, ok := subs.Recv.(closer); ok {
+					c.Close(serverClosed)
 				}
 			}
 
@@ -147,16 +161,66 @@ RUN:
 				return
 			}
 
-			n := len(pub.msg.Data)
-			if n > 30 {
-				n = 30
-			}
+			// n := len(pub.msg.Data)
+			// if n > 30 {
+			// 	n = 30
+			// }
 
 			//if svr.debug {
 			//	log.Printf("[DEBUG] Publish: %q: %q", msg.Topic, string(msg.Buf[:n]))
 			//}
 			topic := strings.Split(pub.msg.Topic, "/")
 			server.Topics.Publish(topic, pub.sender, pub.msg)
+
+		case conn := <-server.connectQueue:
+
+			var client *Client
+			subs := server.Topics.Find([]string{"$SYS", "all"})
+			for ; subs != nil; subs = subs.Next {
+				if recv, ok := subs.Recv.(*Client); ok {
+					if conn.packet.ClientId == recv.Id {
+						if conn.packet.CleanSession {
+							recv.cleanup()
+						} else {
+							client = recv
+						}
+						break
+					}
+				}
+			}
+
+			if client == nil {
+				client = &Client{
+					pending:     make(map[int]Packet),
+					queuePacket: make(chan Packet),
+					queueWriter: make(chan io.Writer),
+					Closer:      conn.stream,
+					Server:      conn.server,
+					subs:        make(map[string]*Subscription),
+					State:       StateConnecting,
+					Context:     context.Background(),
+				}
+
+				if client.connect(conn.packet, conn.stream) == nil {
+
+					client.sysall = NewSubscription(client, 0)
+					server.Topics.Subscribe([]string{"$SYS", "all"}, client.sysall)
+
+					go client.serve()
+					client.serveWriter(conn.stream)
+					go client.serveReader(conn.stream)
+				}
+
+			} else {
+
+				client.Closer = conn.stream
+				client.State = StateConnecting
+				if client.connect(conn.packet, conn.stream) == nil {
+
+					client.serveWriter(conn.stream)
+					go client.serveReader(conn.stream)
+				}
+			}
 		}
 	}
 }
@@ -192,13 +256,11 @@ func serve(listener net.Listener, server Server) error {
 	for {
 		conn, err := listener.Accept()
 		if err == nil {
-			Serve(conn, server)
+			go Serve(conn, server)
 		} else {
 			return err
 		}
 	}
-
-	return nil
 }
 
 func Serve(stream io.ReadWriteCloser, server Server) {
@@ -207,15 +269,17 @@ func Serve(stream io.ReadWriteCloser, server Server) {
 		server = NewServer()
 	}
 
-	client := &Client{
-		pending: make(map[int]Packet),
-		queue:   make(chan Packet),
-		Closer:  stream,
-		Server:  server,
-		subs:    make(map[string]*Subscription),
-		State:   StateConnecting,
-		Context: context.Background(),
+	packet, err := Read(stream)
+	if err != nil {
+		stream.Close()
+		return
 	}
-	go client.serveReader(stream)
-	go client.serveWriter(stream)
+
+	if connect, ok := packet.(*ConnectPacket); ok {
+
+		server.PreConnect(stream, connect, server)
+	} else {
+
+		stream.Close()
+	}
 }

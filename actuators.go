@@ -1,5 +1,11 @@
 package wazihub
 
+import (
+	"strings"
+
+	"github.com/j-forster/Wazihub-API/mqtt"
+)
+
 type Actuator struct {
 	Id              string      `json:"id"`
 	Name            string      `json:"name"`
@@ -8,25 +14,28 @@ type Actuator struct {
 	Value           interface{} `json:"value"`
 }
 
-func Actuation(deviceId, actuatorId string) (chan string, error) {
+type Reciever chan string
+
+func (r Reciever) Publish(client *mqtt.Client, msg *mqtt.Message) error {
+	r <- string(msg.Data)
+	return nil
+}
+
+func Actuation(deviceId, actuatorId string) (Reciever, error) {
 
 	if client == nil {
 		panic("Call wazihub.Login() before using this function.")
 	}
 
-	subs, err := client.Subscribe("devices/"+deviceId+"/actuators/"+actuatorId+"/value", 0x00)
+	topic := "devices/" + deviceId + "/actuators/" + actuatorId + "/value"
+
+	err := client.Subscribe(topic, 0x00)
 	if err != nil {
 		return nil, err
 	}
 
-	channel := make(chan string)
-
-	go (func() {
-		for msg := range subs {
-			channel <- string(msg.Data)
-		}
-		close(channel)
-	})()
-
-	return channel, nil
+	recv := make(Reciever)
+	subs := mqtt.NewSubscription(recv, 0)
+	topics.Subscribe(strings.Split(topic, "/"), subs)
+	return recv, nil
 }

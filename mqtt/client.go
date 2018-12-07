@@ -1,10 +1,12 @@
 package mqtt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 )
 
@@ -15,13 +17,17 @@ type Closer interface {
 const (
 	StateConnecting = iota
 	StateConnected
+	StateDisconnecting
 	StateDisconnected
+	StateSession
 )
 
 var States = [...]string{
 	"connecting",
 	"connected",
+	"disconnecting",
 	"disconnected",
+	"session",
 }
 
 type Client struct {
@@ -35,11 +41,21 @@ type Client struct {
 	//
 	Context context.Context
 
+	CleanSession bool
+
+	Will *Message
+
 	State int
 
-	queue   chan Packet
+	queuePacket chan Packet
+	queueWriter chan io.Writer
+
+	sigServed chan struct{}
+
 	pending map[int]Packet
 	subs    map[string]*Subscription
+
+	sysall *Subscription
 }
 
 var (
@@ -47,17 +63,20 @@ var (
 	unexpectedPacket  = errors.New("Recieved an unexpected packet.")
 )
 
-func Dial(addr string, clientId string, auth *ConnectAuth, will *Message) (*Client, error) {
+func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, will *Message) (*Client, error) {
 
 	client := &Client{
-		Id:      clientId,
-		pending: make(map[int]Packet),
-		queue:   make(chan Packet),
-		Server: &loopback{
-			topics: NewTopic(nil, ""),
-		},
-		subs:  make(map[string]*Subscription),
-		State: StateConnecting,
+		Id:           clientId,
+		pending:      make(map[int]Packet),
+		queuePacket:  make(chan Packet),
+		queueWriter:  make(chan io.Writer),
+		CleanSession: cleanSession,
+		// Server: &loopback{
+		// 	topics: NewTopic(nil, ""),
+		// },
+		Server: make(loopback),
+		subs:   make(map[string]*Subscription),
+		State:  StateConnecting,
 	}
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -66,19 +85,21 @@ func Dial(addr string, clientId string, auth *ConnectAuth, will *Message) (*Clie
 	client.Context = context.Background()
 	client.Closer = conn
 
-	connect := Connect("MQIsdp", byte(0x03), true, 5000, clientId, will, auth)
+	connect := Connect("MQIsdp", byte(0x03), cleanSession, 5000, clientId, will, auth)
 	connect.WriteTo(conn)
 
 	pkt, err := Read(conn)
 	if err != nil {
 		return client, err
 	}
+
 	if connAck, ok := pkt.(*ConnAckPacket); ok {
 		switch connAck.Code {
 		case CodeAccepted:
 			client.State = StateConnected
 			go client.serveReader(conn)
-			go client.serveWriter(conn)
+			go client.serve()
+			client.serveWriter(conn)
 			return client, nil
 
 		default:
@@ -93,9 +114,21 @@ func Dial(addr string, clientId string, auth *ConnectAuth, will *Message) (*Clie
 	}
 }
 
+func (client *Client) Message() chan *Message {
+	if loop, ok := client.Server.(loopback); ok {
+		return loop
+	}
+	return nil
+}
+
 func (client *Client) Send(pkt Packet) error {
 
-	if pkt.Header().QoS != 0x00 {
+	if client.State == StateDisconnected {
+		return nil
+	}
+
+	header := pkt.Header()
+	if header.QoS != 0x00 {
 
 		var id int
 		switch packet := pkt.(type) {
@@ -114,15 +147,8 @@ func (client *Client) Send(pkt Packet) error {
 		}
 	}
 
-	client.queue <- pkt
+	client.queuePacket <- pkt
 	return nil
-
-	/*
-		var buf bytes.Buffer
-		pkt.WriteTo(&buf)
-		fmt.Println(buf.Bytes())
-		return nil
-	*/
 }
 
 func (client *Client) Publish(sender *Client, msg *Message) error {
@@ -134,54 +160,171 @@ func (client *Client) Publish(sender *Client, msg *Message) error {
 	// return nil
 }
 
-func (client *Client) Subscribe(topic string, qos byte) (chan *Message, error) {
+func (client *Client) Subscribe(topic string, qos byte) error {
 
-	channel := make(chan *Message)
-	subscription := client.Server.Subscribe(&channelReciever{channel}, topic, qos)
-	client.subs[topic] = subscription
-	return channel, client.Send(Subscribe(0, []TopicSubscription{TopicSubscription{topic, qos}}))
+	return client.Send(Subscribe(0, []TopicSubscription{TopicSubscription{topic, qos}}))
 }
 
 func (client *Client) Unsubscribe(topic string) {
-	if subs, ok := client.subs[topic]; ok {
-		client.Server.Unsubscribe(subs)
-		delete(client.subs, topic)
+
+	client.Send(Unsubscribe(0, []string{topic}))
+}
+
+func (client *Client) serve() {
+
+	var writer io.Writer
+	buffer := &bytes.Buffer{}
+	client.sigServed = make(chan struct{})
+
+	for {
+		// log.Println("waiting client..")
+		select {
+		case packet := <-client.queuePacket:
+			if packet == nil {
+				close(client.sigServed)
+				return
+			}
+			if writer != nil && buffer.Len() == 0 {
+				packet.WriteTo(writer)
+			} else {
+				packet.WriteTo(buffer)
+				log.Printf("Bufferd %q by %v", client, packet)
+			}
+			// log.Println("Buffer now:", buffer.Len())
+		case writer = <-client.queueWriter:
+			// log.Println("got writer")
+		default:
+			// log.Println("waiting ! client..")
+			if writer != nil && buffer.Len() != 0 {
+				packet, _ := Read(buffer)
+				// log.Println("from buf", packet.Header())
+				packet.WriteTo(writer)
+			} else {
+				select {
+				case packet := <-client.queuePacket:
+					if packet == nil {
+						close(client.sigServed)
+						return
+					}
+					// log.Println("make ! packet", writer, packet.Header())
+					if writer != nil {
+						packet.WriteTo(writer)
+					} else {
+						packet.WriteTo(buffer)
+						log.Printf("Bufferd %q by %v", client, packet)
+					}
+					// log.Println("Buffer now:", buffer.Len())
+				case writer = <-client.queueWriter:
+					// log.Println("got ! writer")
+				}
+			}
+		}
 	}
+
+	/*
+		if buffer.Len() == 0 {
+			if packet, ok := <-client.queuePacket; ok {
+				packet.WriteTo(writer)
+			}
+			} else {
+				packet, _ := Read(buffer)
+				packet.WriteTo(writer)
+			}
+		}
+	*/
 }
 
 func (client *Client) serveWriter(writer io.Writer) {
 
-	for pkt := range client.queue {
-		pkt.WriteTo(writer)
-	}
+	client.queueWriter <- writer
+
+	/*
+		for pkt := range client.queue {
+			pkt.WriteTo(writer)
+		}
+
+		log.Println("Closing", client.Id, " to ", client.State == StateSession)
+
+		if client.State == StateSession {
+
+			session, err := os.OpenFile("session/"+client.Id+".dump", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			for pkt := range client.queue {
+				pkt.WriteTo(session)
+			}
+		}
+	*/
 }
 
 func (client *Client) Disconnect() {
+
+	if client.State != StateConnected {
+		return
+	}
+	client.State = StateDisconnecting
+
+	client.Send(Disconnect())
+
 	client.Close(nil)
+}
+
+func (client *Client) String() string {
+	return client.Id
+}
+
+func (client *Client) cleanup() {
+
+	// unsubscribe all
+	for _, sub := range client.subs {
+		client.Server.Unsubscribe(sub)
+	}
+	if client.sysall != nil {
+		client.Server.Unsubscribe(client.sysall)
+	}
+	client.subs = nil
+
+	if client.Closer != nil {
+		// this should close the network connection
+		client.Closer.Close()
+		client.Closer = nil
+		// and will make .Read & .Write calls fail
+		// so that .serveReader terminates
+	}
 }
 
 func (client *Client) Close(err error) {
 
-	if client.State == StateDisconnected {
+	if client.State == StateDisconnected || client.State == StateSession {
 		return
-	}
-
-	for _, sub := range client.subs {
-		client.Server.Unsubscribe(sub)
-	}
-
-	client.subs = nil
-
-	if client.State == StateConnected {
-		client.Send(Disconnect())
 	}
 
 	client.Server.Disconnect(client, err)
 
-	client.State = StateDisconnected
+	if client.Will != nil && err != nil {
+		will := client.Will
+		client.Will = nil
+		client.Publish(nil, will)
+	}
 
-	if client.Closer != nil {
-		client.Closer.Close()
+	if client.CleanSession || err == nil {
+
+		client.State = StateDisconnected
+
+		client.cleanup()
+
+		// will end the .serve() and trigger sigServed
+		close(client.queuePacket)
+		<-client.sigServed
+		// must be closed after sigServed
+		close(client.queueWriter)
+
+	} else {
+
+		client.State = StateSession
+		client.queueWriter <- nil
 	}
 }
 
@@ -191,7 +334,9 @@ var (
 	UnacceptableProtoV = errors.New("Unacceptable protocol verion. Expected '0x03'.")
 	ClientIdRejected   = errors.New("Client-Id too long or too short.")
 	UnknownPacketType  = errors.New("Unknown packet type.")
+	Unaccepted         = errors.New("Connection not accepted.")
 	connRefused        = errors.New("The remote station rejected the connection.")
+	recoveredRead      = errors.New("Reading error.")
 )
 
 func unknownPacketErr(mtype byte, state int) error {
@@ -208,222 +353,231 @@ func (client *Client) serveReader(reader io.Reader) {
 			return
 		}
 
-		switch pkt := packet.(type) {
-		case *ConnectPacket:
+		client.consume(packet)
+		if client.State != StateConnected {
+			return
+		}
+	}
+}
 
-			if client.State != StateConnecting {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
+func (client *Client) connect(pkt *ConnectPacket, w io.Writer) error {
 
-			if pkt.Protocol != "MQIsdp" {
-				err := fmt.Errorf("unsupported protocol '%.12s'", pkt.Protocol)
+	if client.State != StateConnecting && client.State != StateSession {
+		return unknownPacketErr(pkt.header.MType, client.State)
+	}
+
+	if pkt.Protocol != "MQIsdp" {
+		return fmt.Errorf("unsupported protocol '%.12s'", pkt.Protocol)
+	}
+	if pkt.Version != 0x03 {
+		return UnacceptableProtoV
+	}
+	if pkt.Will != nil {
+		// log.Printf("[MQTT ] Will: topic:%q qos:%d %q\n", pkt.Will.Topic, pkt.Will.QoS, pkt.Will.Data)
+		client.Will = pkt.Will
+	}
+
+	client.CleanSession = pkt.CleanSession
+
+	if len(pkt.ClientId) < 3 || len(pkt.ClientId) > 128 {
+		return ClientIdRejected
+	}
+
+	client.Id = pkt.ClientId
+
+	code := client.Server.Connect(client, pkt.Auth)
+
+	ConnAck(code).WriteTo(w)
+	if code != CodeAccepted {
+		return Unaccepted
+	}
+
+	client.State = StateConnected
+	return nil
+}
+
+func (client *Client) consume(packet Packet) {
+
+	switch pkt := packet.(type) {
+	case *ConnectPacket:
+
+		client.Close(unknownPacketErr(pkt.header.MType, client.State))
+
+	case *ConnAckPacket:
+
+		if client.State != StateConnecting {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		if pkt.Code != 0 {
+
+			if int(pkt.Code) > 0 && int(pkt.Code) < len(Codes) {
+				err := errors.New("Connection refused: " + Codes[int(pkt.Code)])
 				client.Close(err)
 				return
 			}
-			if pkt.Version != 0x03 {
-				client.Close(UnacceptableProtoV)
-				return
-			}
-			if pkt.Will != nil {
-				// log.Printf("[MQTT ] Will: topic:%q qos:%d %q\n", pkt.Will.Topic, pkt.Will.QoS, pkt.Will.Data)
-			}
-			if pkt.CleanSession {
-				// log.Printf("[MQTT ] Clean Session.")
-			}
-			if len(pkt.ClientId) < 3 || len(pkt.ClientId) > 128 {
-				client.Close(ClientIdRejected)
-				return
-			}
-
-			client.Id = pkt.ClientId
-
-			code := client.Server.Connect(client, pkt.Auth)
-
-			client.Send(ConnAck(code))
-			if code != CodeAccepted {
-				client.Close(nil)
-				return
-			}
-
-			client.State = StateConnected
-
-		case *ConnAckPacket:
-
-			if client.State != StateConnecting {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			if pkt.Code != 0 {
-
-				if int(pkt.Code) > 0 && int(pkt.Code) < len(Codes) {
-					err := errors.New("Connection refused: " + Codes[int(pkt.Code)])
-					client.Close(err)
-					return
-				}
-				client.Close(connectionRefused)
-				return
-			}
-
-			client.State = StateConnected
-
-		case *SubscribePacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			granted := make([]TopicSubscription, len(pkt.Topics))
-
-			for i, topic := range pkt.Topics {
-				granted[i].Name = topic.Name
-
-				subs, ok := client.subs[topic.Name]
-				if !ok {
-					subs = client.Server.Subscribe(client, topic.Name, topic.QoS)
-					client.subs[topic.Name] = subs
-				}
-				granted[i].QoS = subs.QoS
-			}
-
-			client.Send(SubAck(pkt.Id, granted))
-
-		case *SubAckPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			// Delete from pending to stop resending Publish
-			delete(client.pending, pkt.Id)
-
-		case *UnsubscribePacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			for _, topic := range pkt.Topics {
-				if subs, ok := client.subs[topic]; ok {
-					client.Server.Unsubscribe(subs)
-					delete(client.subs, topic)
-				}
-			}
-
-			client.Send(UnsubAck(pkt.Id))
-
-		case *UnsubAckPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			// might already be deleted from previous duplicate PubAck packets
-			delete(client.pending, pkt.Id)
-
-		case *PublishPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			switch pkt.Header().QoS {
-			case 0x00: // At most once
-
-				client.Server.Publish(client, pkt.Message())
-
-			case 0x01: // At least once
-
-				client.Server.Publish(client, pkt.Message())
-
-				// Acknowledge the Publishing
-				client.Send(PubAck(pkt.Id))
-
-			case 0x02: // Exactly once
-
-				client.Send(PubRec(pkt.Id))
-
-				// we stop here if we already recieved this Publish (with the same Id)
-				if _, ok := client.pending[pkt.Id]; ok {
-					break
-				}
-
-				client.Server.Publish(client, pkt.Message())
-
-				// to indicate that this Message Id is taken
-				client.pending[pkt.Id] = nil
-			}
-
-		case *PubAckPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			// might already be deleted from previous duplicate PubAck packets
-			delete(client.pending, pkt.Id)
-
-		case *PubRelPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			client.Send(PubComp(pkt.Id))
-			// might already be deleted from previous duplicate PubRel packets
-			delete(client.pending, pkt.Id)
-
-		case *PubRecPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			// delete from pending to stop resending Publish
-			delete(client.pending, pkt.Id)
-			client.Send(PubRel(pkt.Id))
-
-		case *PubCompPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			// delete from pending to stop resending PubRel
-			delete(client.pending, pkt.Id)
-
-		case *PingReqPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-			// Ping Request -> Response
-			client.Send(PingResp())
-
-		case *DisconnectPacket:
-
-			if client.State != StateConnected {
-				client.Close(unknownPacketErr(pkt.header.MType, client.State))
-				return
-			}
-
-			client.Close(nil)
-			return
-
-		default:
-			client.Close(UnknownPacketType)
+			client.Close(connectionRefused)
 			return
 		}
+
+		client.State = StateConnected
+
+	case *SubscribePacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		granted := make([]TopicSubscription, len(pkt.Topics))
+
+		for i, topic := range pkt.Topics {
+			granted[i].Name = topic.Name
+
+			subs, ok := client.subs[topic.Name]
+			if !ok {
+				subs = client.Server.Subscribe(client, topic.Name, topic.QoS)
+				client.subs[topic.Name] = subs
+			}
+			granted[i].QoS = subs.QoS
+		}
+
+		client.Send(SubAck(pkt.Id, granted))
+
+	case *SubAckPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		// Delete from pending to stop resending Publish
+		delete(client.pending, pkt.Id)
+
+	case *UnsubscribePacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		for _, topic := range pkt.Topics {
+			if subs, ok := client.subs[topic]; ok {
+				client.Server.Unsubscribe(subs)
+				delete(client.subs, topic)
+			}
+		}
+
+		client.Send(UnsubAck(pkt.Id))
+
+	case *UnsubAckPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		// might already be deleted from previous duplicate PubAck packets
+		delete(client.pending, pkt.Id)
+
+	case *PublishPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		switch pkt.Header().QoS {
+		case 0x00: // At most once
+
+			client.Server.Publish(client, pkt.Message())
+
+		case 0x01: // At least once
+
+			client.Server.Publish(client, pkt.Message())
+
+			// Acknowledge the Publishing
+			client.Send(PubAck(pkt.Id))
+
+		case 0x02: // Exactly once
+
+			client.Send(PubRec(pkt.Id))
+
+			// we stop here if we already recieved this Publish (with the same Id)
+			if _, ok := client.pending[pkt.Id]; ok {
+				break
+			}
+
+			client.Server.Publish(client, pkt.Message())
+
+			// to indicate that this Message Id is taken
+			client.pending[pkt.Id] = nil
+		}
+
+	case *PubAckPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		// might already be deleted from previous duplicate PubAck packets
+		delete(client.pending, pkt.Id)
+
+	case *PubRelPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		client.Send(PubComp(pkt.Id))
+		// might already be deleted from previous duplicate PubRel packets
+		delete(client.pending, pkt.Id)
+
+	case *PubRecPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		// delete from pending to stop resending Publish
+		delete(client.pending, pkt.Id)
+		client.Send(PubRel(pkt.Id))
+
+	case *PubCompPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		// delete from pending to stop resending PubRel
+		delete(client.pending, pkt.Id)
+
+	case *PingReqPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+		// Ping Request -> Response
+		client.Send(PingResp())
+
+	case *DisconnectPacket:
+
+		if client.State != StateConnected {
+			client.Close(unknownPacketErr(pkt.header.MType, client.State))
+			return
+		}
+
+		client.Close(nil)
+		return
+
+	default:
+		client.Close(UnknownPacketType)
+		return
 	}
 }

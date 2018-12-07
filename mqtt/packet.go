@@ -7,7 +7,7 @@ import (
 )
 
 type Packet interface {
-	WriteTo(w io.Writer) error
+	WriteTo(w io.Writer) error // (int64, error)
 	Header() *FixedHeader
 }
 

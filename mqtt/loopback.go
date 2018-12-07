@@ -1,6 +1,8 @@
 package mqtt
 
-import "strings"
+import (
+	"io"
+)
 
 type channelReciever struct {
 	channel chan *Message
@@ -13,6 +15,32 @@ func (cr *channelReciever) Publish(client *Client, msg *Message) error {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+type loopback chan *Message
+
+func (loop loopback) Publish(client *Client, msg *Message) error {
+	loop <- msg
+	return nil
+}
+
+func (loop loopback) Connect(client *Client, auth *ConnectAuth) byte {
+	return CodeAccepted
+}
+
+func (loop loopback) PreConnect(stream io.ReadWriteCloser, connect *ConnectPacket, server Server) {
+	panic("Client can not handle connect.")
+}
+
+func (loop loopback) Disconnect(client *Client, err error) {
+}
+
+func (loop loopback) Subscribe(recv Reciever, topic string, qos byte) *Subscription {
+	return nil
+}
+
+func (loop loopback) Unsubscribe(subs *Subscription) {
+}
+
+/*
 type loopback struct {
 	topics *Topic
 	//subs   map[string]*Subscription
@@ -29,6 +57,10 @@ func (loop *loopback) Connect(client *Client, auth *ConnectAuth) byte {
 	return CodeAccepted
 }
 
+func (loop *loopback) PreConnect(stream io.ReadWriteCloser, connect *ConnectPacket, server Server) {
+	log.Println("PreConnect?")
+}
+
 func (loop *loopback) Disconnect(client *Client, err error) {
 }
 
@@ -41,13 +73,14 @@ func (loop *loopback) Subscribe(recv Reciever, topic string, qos byte) *Subscrip
 }
 
 func (loop *loopback) Unsubscribe(subs *Subscription) {
-	/*for topic, s := range loop.subs {
-		if s == subs {
-			delete(loop.subs, topic)
-		}
-	}*/
+	// for topic, s := range loop.subs {
+	// 	if s == subs {
+	// 		delete(loop.subs, topic)
+	// 	}
+	// }
 	if recv, ok := subs.Recv.(*channelReciever); ok {
 		close(recv.channel)
 	}
 	subs.Unsubscribe()
 }
+*/
