@@ -59,15 +59,12 @@ type FixedHeader struct {
 	Length int
 }
 
-func (fh *FixedHeader) Read(reader io.Reader) error {
+func (fh *FixedHeader) Read(reader io.Reader) (int, error) {
 
 	var headBuf [1]byte
 	n, err := reader.Read(headBuf[:])
-	if err != nil {
-		return err // read error
-	}
 	if n == 0 {
-		return io.EOF // connection closed
+		return 0, err // connection closed
 	}
 
 	fh.MType = byte(headBuf[0] >> 4)
@@ -76,25 +73,24 @@ func (fh *FixedHeader) Read(reader io.Reader) error {
 	fh.Retain = bool(headBuf[0]&0x1 != 0)
 
 	if fh.MType == 0 || fh.MType == 15 {
-		return ReservedMessageType // reserved type
+		return 1, ReservedMessageType // reserved type
 	}
 
 	var multiplier int = 1
 	var length int
+	var d int
 
 	for {
-		n, err = reader.Read(headBuf[:])
-		if err != nil {
-			return err // read error
+		d, err = reader.Read(headBuf[:])
+		if d == 0 {
+			return n, err // connection closed in header
 		}
-		if n == 0 {
-			return IncompleteHeader // connection closed in header
-		}
+		n++
 
 		length += int(headBuf[0]&127) * multiplier
 
 		if length > MaxMessageLength {
-			return MessageLengthExceeded // server maximum message size exceeded
+			return n, MessageLengthExceeded // server maximum message size exceeded
 		}
 
 		if headBuf[0]&128 == 0 {
@@ -102,21 +98,21 @@ func (fh *FixedHeader) Read(reader io.Reader) error {
 		}
 
 		if multiplier > 0x4000 {
-			return MessageLengthInvalid // mqtt maximum message size exceeded
+			return n, MessageLengthInvalid // mqtt maximum message size exceeded
 		}
 
 		multiplier *= 128
 	}
 
 	fh.Length = length
-	return nil
+	return n, nil
 }
 
 var (
 	MessageTooLong = errors.New("Message too long.")
 )
 
-func (fh *FixedHeader) WriteTo(w io.Writer) error {
+func (fh *FixedHeader) WriteTo(w io.Writer) (int, error) {
 
 	var b byte
 	b = fh.MType << 4
@@ -129,14 +125,11 @@ func (fh *FixedHeader) WriteTo(w io.Writer) error {
 	}
 
 	if fh.Length < 0x80 {
-		_, err := w.Write([]byte{b, byte(fh.Length)})
-		return err
+		return w.Write([]byte{b, byte(fh.Length)})
 	} else if fh.Length < 0x8000 {
-		_, err := w.Write([]byte{b, byte(fh.Length & 127), byte(fh.Length >> 7)})
-		return err
+		return w.Write([]byte{b, byte(fh.Length & 127), byte(fh.Length >> 7)})
 	} else if fh.Length < 0x8000 {
-		_, err := w.Write([]byte{b, byte(fh.Length & 127), byte((fh.Length >> 7) & 127), byte(fh.Length >> 14)})
-		return err
+		return w.Write([]byte{b, byte(fh.Length & 127), byte((fh.Length >> 7) & 127), byte(fh.Length >> 14)})
 	}
-	return MessageTooLong
+	return 0, MessageTooLong
 }

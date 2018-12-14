@@ -191,14 +191,15 @@ RUN:
 
 			if client == nil {
 				client = &Client{
-					pending:     make(map[int]Packet),
-					queuePacket: make(chan Packet),
-					queueWriter: make(chan io.Writer),
-					Closer:      conn.stream,
-					Server:      conn.server,
-					subs:        make(map[string]*Subscription),
-					State:       StateConnecting,
-					Context:     context.Background(),
+					pending: make(map[int]Packet),
+					// queuePacket: make(chan Packet),
+					// queueWriter: make(chan io.Writer),
+					Closer:    conn.stream,
+					Server:    conn.server,
+					subs:      make(map[string]*Subscription),
+					State:     StateConnecting,
+					Context:   context.Background(),
+					sigServed: make(chan struct{}),
 				}
 
 				if client.connect(conn.packet, conn.stream) == nil {
@@ -206,13 +207,13 @@ RUN:
 					client.sysall = NewSubscription(client, 0)
 					server.Topics.Subscribe([]string{"$SYS", "all"}, client.sysall)
 
-					go client.serve()
-					client.serveWriter(conn.stream)
+					go client.serveWriter(conn.stream)
 					go client.serveReader(conn.stream)
 				}
 
 			} else {
 
+				client.sigServed = make(chan struct{})
 				client.Closer = conn.stream
 				client.State = StateConnecting
 				if client.connect(conn.packet, conn.stream) == nil {
@@ -269,7 +270,7 @@ func Serve(stream io.ReadWriteCloser, server Server) {
 		server = NewServer()
 	}
 
-	packet, err := Read(stream)
+	packet, _, err := Read(stream)
 	if err != nil {
 		stream.Close()
 		return

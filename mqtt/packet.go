@@ -7,56 +7,61 @@ import (
 )
 
 type Packet interface {
-	WriteTo(w io.Writer) error // (int64, error)
+	WriteTo(w io.Writer) (int, error) // (int64, error)
 	Header() *FixedHeader
 }
 
-func Read(reader io.Reader) (Packet, error) {
+func Read(reader io.Reader) (Packet, int, error) {
 
 	var fh FixedHeader
-	if err := fh.Read(reader); err != nil {
-		return nil, err
+	var n int
+	var err error
+	if n, err = fh.Read(reader); err != nil {
+		return nil, n, err
 	}
 
 	buf := make([]byte, fh.Length)
 
-	_, err := io.ReadFull(reader, buf)
+	d, err := io.ReadFull(reader, buf)
+	n += d
 	if err != nil {
-		return nil, err
+		return nil, n, err
 	}
 
+	var pkt Packet
 	switch fh.MType {
 	case CONNECT:
-		return readConnect(&fh, buf)
+		pkt, err = readConnect(&fh, buf)
 	case CONNACK:
-		return readConnAck(&fh, buf)
+		pkt, err = readConnAck(&fh, buf)
 	case SUBSCRIBE:
-		return readSubscribe(&fh, buf)
+		pkt, err = readSubscribe(&fh, buf)
 	case SUBACK:
-		return readSubAck(&fh, buf)
+		pkt, err = readSubAck(&fh, buf)
 	case UNSUBSCRIBE:
-		return readUnsubscribe(&fh, buf)
+		pkt, err = readUnsubscribe(&fh, buf)
 	case UNSUBACK:
-		return readUnsubAck(&fh, buf)
+		pkt, err = readUnsubAck(&fh, buf)
 	case PUBLISH:
-		return readPublish(&fh, buf)
+		pkt, err = readPublish(&fh, buf)
 	case PUBACK:
-		return readPubAck(&fh, buf)
+		pkt, err = readPubAck(&fh, buf)
 	case PUBREL:
-		return readPubRel(&fh, buf)
+		pkt, err = readPubRel(&fh, buf)
 	case PUBREC:
-		return readPubRec(&fh, buf)
+		pkt, err = readPubRec(&fh, buf)
 	case PUBCOMP:
-		return readPubComp(&fh, buf)
+		pkt, err = readPubComp(&fh, buf)
 	case PINGREQ:
-		return readPingReq(&fh, buf)
+		pkt, err = readPingReq(&fh, buf)
 	case PINGRESP:
-		return readPingResp(&fh, buf)
+		pkt, err = readPingResp(&fh, buf)
 	case DISCONNECT:
-		return readDisconnect(&fh, buf)
+		pkt, err = readDisconnect(&fh, buf)
 	default:
-		return nil, fmt.Errorf("Unknown MQTT message type: %d", fh.MType)
+		err = fmt.Errorf("Unknown MQTT message type: %d", fh.MType)
 	}
+	return pkt, n, err
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -79,13 +84,25 @@ type ConnectPacket struct {
 	Auth     *ConnectAuth
 }
 
-func (pkt *ConnectPacket) WriteTo(w io.Writer) error {
+func (pkt *ConnectPacket) WriteTo(w io.Writer) (len int, err error) {
 
-	pkt.Header().WriteTo(w)
+	var d int
+	len, err = pkt.Header().WriteTo(w)
+	if err != nil {
+		return
+	}
 
-	writeString(w, pkt.Protocol)
+	d, err = writeString(w, pkt.Protocol)
+	len += d
+	if err != nil {
+		return
+	}
 
-	w.Write([]byte{pkt.Version})
+	d, err = w.Write([]byte{pkt.Version})
+	len += d
+	if err != nil {
+		return
+	}
 
 	var flag byte
 	if pkt.CleanSession {
@@ -103,23 +120,51 @@ func (pkt *ConnectPacket) WriteTo(w io.Writer) error {
 		flag |= 0x80 // PAssword
 	}
 
-	w.Write([]byte{flag})
+	d, err = w.Write([]byte{flag})
+	len += d
+	if err != nil {
+		return
+	}
 
-	writeInt(w, pkt.KeepAliveTimer)
+	d, err = writeInt(w, pkt.KeepAliveTimer)
+	len += d
+	if err != nil {
+		return
+	}
 
-	writeString(w, pkt.ClientId)
+	d, err = writeString(w, pkt.ClientId)
+	len += d
+	if err != nil {
+		return
+	}
 
 	if pkt.Will != nil {
-		writeString(w, pkt.Will.Topic)
-		writeBytes(w, pkt.Will.Data)
+		d, err = writeString(w, pkt.Will.Topic)
+		len += d
+		if err != nil {
+			return
+		}
+		d, err = writeBytes(w, pkt.Will.Data)
+		len += d
+		if err != nil {
+			return
+		}
 	}
 
 	if pkt.Auth != nil {
-		writeString(w, pkt.Auth.Username)
-		writeString(w, pkt.Auth.Password)
+		d, err = writeString(w, pkt.Auth.Username)
+		len += d
+		if err != nil {
+			return
+		}
+		d, err = writeString(w, pkt.Auth.Password)
+		len += d
+		if err != nil {
+			return
+		}
 	}
 
-	return nil
+	return
 }
 
 func (pkt *ConnectPacket) Header() *FixedHeader {
@@ -289,10 +334,15 @@ func (pkt *ConnAckPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *ConnAckPacket) WriteTo(w io.Writer) error {
-	pkt.header.WriteTo(w)
-	w.Write([]byte{pkt.Code, 0x00})
-	return nil
+func (pkt *ConnAckPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.header.WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = w.Write([]byte{pkt.Code, 0x00})
+	n += d
+	return
 }
 
 func ConnAck(code byte) *ConnAckPacket {
@@ -361,14 +411,30 @@ func (pkt *SubscribePacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *SubscribePacket) WriteTo(w io.Writer) error {
-	pkt.Header().WriteTo(w)
-	writeInt(w, pkt.Id)
-	for _, topic := range pkt.Topics {
-		writeString(w, topic.Name)
-		w.Write([]byte{topic.QoS})
+func (pkt *SubscribePacket) WriteTo(w io.Writer) (len int, err error) {
+	var d int
+	len, err = pkt.Header().WriteTo(w)
+	if err != nil {
+		return
 	}
-	return nil
+	d, err = writeInt(w, pkt.Id)
+	len += d
+	if err != nil {
+		return
+	}
+	for _, topic := range pkt.Topics {
+		d, err = writeString(w, topic.Name)
+		len += d
+		if err != nil {
+			return
+		}
+		d, err = w.Write([]byte{topic.QoS})
+		len += d
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 func readSubscribe(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -460,13 +526,25 @@ func (pkt *UnsubscribePacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *UnsubscribePacket) WriteTo(w io.Writer) error {
-	pkt.Header().WriteTo(w)
-	writeInt(w, pkt.Id)
-	for _, topic := range pkt.Topics {
-		writeString(w, topic)
+func (pkt *UnsubscribePacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.Header().WriteTo(w)
+	if err != nil {
+		return
 	}
-	return nil
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	if err != nil {
+		return
+	}
+	for _, topic := range pkt.Topics {
+		d, err = writeString(w, topic)
+		n += d
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 func readUnsubscribe(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -530,13 +608,25 @@ func (pkt *SubAckPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *SubAckPacket) WriteTo(w io.Writer) error {
-	pkt.Header().WriteTo(w)
-	writeInt(w, pkt.Id)
-	for _, topic := range pkt.Topics {
-		w.Write([]byte{topic.QoS})
+func (pkt *SubAckPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.Header().WriteTo(w)
+	if err != nil {
+		return
 	}
-	return nil
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	if err != nil {
+		return
+	}
+	for _, topic := range pkt.Topics {
+		d, err = w.Write([]byte{topic.QoS})
+		n += d
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 var InvalidQoS = errors.New("Invalid QoS.")
@@ -587,10 +677,15 @@ func (pkt *UnsubAckPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *UnsubAckPacket) WriteTo(w io.Writer) error {
-	pkt.Header().WriteTo(w)
-	writeInt(w, pkt.Id)
-	return nil
+func (pkt *UnsubAckPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.Header().WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	return
 }
 
 func readUnsubAck(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -649,16 +744,26 @@ func (pkt *PublishPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PublishPacket) WriteTo(w io.Writer) error {
+func (pkt *PublishPacket) WriteTo(w io.Writer) (n int, err error) {
 
-	pkt.Header().WriteTo(w)
+	var d int
+	n, err = pkt.Header().WriteTo(w)
 
-	writeString(w, pkt.Topic)
-	if pkt.header.QoS > 0 {
-		writeInt(w, pkt.Id)
+	d, err = writeString(w, pkt.Topic)
+	if err != nil {
+		return
 	}
-	w.Write(pkt.Data)
-	return nil
+	n += d
+	if pkt.header.QoS > 0 {
+		d, err = writeInt(w, pkt.Id)
+		if err != nil {
+			return
+		}
+		n += d
+	}
+	d, err = w.Write(pkt.Data)
+	n += d
+	return
 }
 
 func readPublish(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -713,10 +818,15 @@ func (pkt *PubAckPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PubAckPacket) WriteTo(w io.Writer) error {
-	pkt.header.WriteTo(w)
-	writeInt(w, pkt.Id)
-	return nil
+func (pkt *PubAckPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.header.WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	return
 }
 
 func readPubAck(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -753,10 +863,15 @@ func (pkt *PubRelPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PubRelPacket) WriteTo(w io.Writer) error {
-	pkt.header.WriteTo(w)
-	writeInt(w, pkt.Id)
-	return nil
+func (pkt *PubRelPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.header.WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	return
 }
 
 func readPubRel(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -811,10 +926,15 @@ func (pkt *PubRecPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PubRecPacket) WriteTo(w io.Writer) error {
-	pkt.header.WriteTo(w)
-	writeInt(w, pkt.Id)
-	return nil
+func (pkt *PubRecPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.header.WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	return
 }
 
 func readPubRec(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -860,10 +980,15 @@ func (pkt *PubCompPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PubCompPacket) WriteTo(w io.Writer) error {
-	pkt.header.WriteTo(w)
-	writeInt(w, pkt.Id)
-	return nil
+func (pkt *PubCompPacket) WriteTo(w io.Writer) (n int, err error) {
+	var d int
+	n, err = pkt.header.WriteTo(w)
+	if err != nil {
+		return
+	}
+	d, err = writeInt(w, pkt.Id)
+	n += d
+	return
 }
 
 func readPubComp(fh *FixedHeader, buf []byte) (Packet, error) {
@@ -898,7 +1023,7 @@ func (pkt *PingReqPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PingReqPacket) WriteTo(w io.Writer) error {
+func (pkt *PingReqPacket) WriteTo(w io.Writer) (int, error) {
 	return pkt.header.WriteTo(w)
 }
 
@@ -925,7 +1050,7 @@ func (pkt *PingRespPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *PingRespPacket) WriteTo(w io.Writer) error {
+func (pkt *PingRespPacket) WriteTo(w io.Writer) (int, error) {
 	return pkt.header.WriteTo(w)
 }
 
@@ -952,7 +1077,7 @@ func (pkt *DisconnectPacket) Header() *FixedHeader {
 	return pkt.header
 }
 
-func (pkt *DisconnectPacket) WriteTo(w io.Writer) error {
+func (pkt *DisconnectPacket) WriteTo(w io.Writer) (int, error) {
 	return pkt.header.WriteTo(w)
 }
 

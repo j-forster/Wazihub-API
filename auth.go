@@ -2,6 +2,7 @@ package wazihub
 
 import (
 	"strings"
+	"time"
 
 	"github.com/j-forster/Wazihub-API/mqtt"
 )
@@ -18,17 +19,26 @@ func Login(username, password string) error {
 
 	id := CurrentDeviceId()
 
-	dial, err := mqtt.Dial(":1883", id, true, auth, nil)
-	if err == nil {
+	for i := 0; ; i++ {
 
-		client = dial
-		topics = mqtt.NewTopic(nil, "")
+		dial, err := mqtt.Dial(":1883", id, true, auth, nil)
+		if err == nil {
 
-		go func() {
-			for msg := range client.Message() {
-				topics.Publish(strings.Split(msg.Topic, "/"), client, msg)
-			}
-		}()
+			client = dial
+			topics = mqtt.NewTopic(nil, "")
+
+			go func() {
+				for msg := range client.Message() {
+					topics.Publish(strings.Split(msg.Topic, "/"), client, msg)
+				}
+			}()
+			return nil
+		}
+
+		if i == 5 {
+			return err
+		}
+
+		time.Sleep(time.Second * 1)
 	}
-	return err
 }

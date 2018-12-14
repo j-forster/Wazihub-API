@@ -1,12 +1,10 @@
 package mqtt
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 )
 
@@ -47,13 +45,17 @@ type Client struct {
 
 	State int
 
-	queuePacket chan Packet
-	queueWriter chan io.Writer
+	Error error
+
+	// queuePacket chan Packet
+	// queueWriter chan io.Writer
 
 	sigServed chan struct{}
 
 	pending map[int]Packet
 	subs    map[string]*Subscription
+
+	pktQueue Queue
 
 	sysall *Subscription
 }
@@ -61,23 +63,27 @@ type Client struct {
 var (
 	connectionRefused = errors.New("The server declined the connection.")
 	unexpectedPacket  = errors.New("Recieved an unexpected packet.")
+	errDisconnected   = errors.New("not connected")
 )
 
 func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, will *Message) (*Client, error) {
 
 	client := &Client{
-		Id:           clientId,
-		pending:      make(map[int]Packet),
-		queuePacket:  make(chan Packet),
-		queueWriter:  make(chan io.Writer),
+		Id:      clientId,
+		pending: make(map[int]Packet),
+		// queuePacket:  make(chan Packet),
+		// queueWriter:  make(chan io.Writer),
 		CleanSession: cleanSession,
 		// Server: &loopback{
 		// 	topics: NewTopic(nil, ""),
 		// },
-		Server: make(loopback),
-		subs:   make(map[string]*Subscription),
-		State:  StateConnecting,
+		Server:    make(loopback),
+		subs:      make(map[string]*Subscription),
+		State:     StateConnecting,
+		sigServed: make(chan struct{}),
 	}
+	client.pktQueue.id = clientId
+
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -88,7 +94,7 @@ func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, wi
 	connect := Connect("MQIsdp", byte(0x03), cleanSession, 5000, clientId, will, auth)
 	connect.WriteTo(conn)
 
-	pkt, err := Read(conn)
+	pkt, _, err := Read(conn)
 	if err != nil {
 		return client, err
 	}
@@ -97,9 +103,8 @@ func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, wi
 		switch connAck.Code {
 		case CodeAccepted:
 			client.State = StateConnected
-			go client.serveReader(conn)
-			go client.serve()
 			client.serveWriter(conn)
+			go client.serveReader(conn)
 			return client, nil
 
 		default:
@@ -121,10 +126,10 @@ func (client *Client) Message() chan *Message {
 	return nil
 }
 
-func (client *Client) Send(pkt Packet) error {
+func (client *Client) Send(pkt Packet) (int, error) {
 
 	if client.State == StateDisconnected {
-		return nil
+		return 0, errDisconnected
 	}
 
 	header := pkt.Header()
@@ -147,22 +152,28 @@ func (client *Client) Send(pkt Packet) error {
 		}
 	}
 
-	client.queuePacket <- pkt
-	return nil
+	n, err := client.pktQueue.WritePacket(pkt)
+	if err != nil {
+		close(client.sigServed)
+	}
+	return n, err
 }
 
+// Publish a new message.
 func (client *Client) Publish(sender *Client, msg *Message) error {
 	// if client != sender {
 	// We don't notify ourselves.
 	// ( is that correct? )
-	return client.Send(Publish(msg))
+	_, err := client.Send(Publish(msg))
+	return err
 	// }
 	// return nil
 }
 
 func (client *Client) Subscribe(topic string, qos byte) error {
 
-	return client.Send(Subscribe(0, []TopicSubscription{TopicSubscription{topic, qos}}))
+	_, err := client.Send(Subscribe(0, []TopicSubscription{TopicSubscription{topic, qos}}))
+	return err
 }
 
 func (client *Client) Unsubscribe(topic string) {
@@ -170,6 +181,7 @@ func (client *Client) Unsubscribe(topic string) {
 	client.Send(Unsubscribe(0, []string{topic}))
 }
 
+/*
 func (client *Client) serve() {
 
 	var writer io.Writer
@@ -221,7 +233,7 @@ func (client *Client) serve() {
 		}
 	}
 
-	/*
+	/
 		if buffer.Len() == 0 {
 			if packet, ok := <-client.queuePacket; ok {
 				packet.WriteTo(writer)
@@ -231,12 +243,27 @@ func (client *Client) serve() {
 				packet.WriteTo(writer)
 			}
 		}
-	*/
+	/
+}
+*/
+
+type wrappedWriter struct {
+	io.Writer
 }
 
-func (client *Client) serveWriter(writer io.Writer) {
+func (w wrappedWriter) WritePacket(p Packet) (int, error) {
+	return p.WriteTo(w)
+}
 
-	client.queueWriter <- writer
+func (client *Client) serveWriter(w io.Writer) error {
+
+	err := client.pktQueue.ServeWriter(&wrappedWriter{w})
+	if err != nil {
+		close(client.sigServed)
+	}
+	return err
+
+	//client.queueWriter <- writer
 
 	/*
 		for pkt := range client.queue {
@@ -259,6 +286,7 @@ func (client *Client) serveWriter(writer io.Writer) {
 	*/
 }
 
+// Disconnect the client from the server.
 func (client *Client) Disconnect() {
 
 	if client.State != StateConnected {
@@ -301,6 +329,7 @@ func (client *Client) Close(err error) {
 		return
 	}
 
+	client.Error = err
 	client.Server.Disconnect(client, err)
 
 	if client.Will != nil && err != nil {
@@ -313,40 +342,49 @@ func (client *Client) Close(err error) {
 
 		client.State = StateDisconnected
 
+		client.pktQueue.Flush()
 		client.cleanup()
 
-		// will end the .serve() and trigger sigServed
-		close(client.queuePacket)
-		<-client.sigServed
+		// close(client.queuePacket)
+
+		//<-client.sigServed
 		// must be closed after sigServed
-		close(client.queueWriter)
+		// close(client.queueWriter)
 
 	} else {
 
 		client.State = StateSession
-		client.queueWriter <- nil
+		//client.queueWriter <- nil
 	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 var (
-	UnacceptableProtoV = errors.New("Unacceptable protocol verion. Expected '0x03'.")
-	ClientIdRejected   = errors.New("Client-Id too long or too short.")
-	UnknownPacketType  = errors.New("Unknown packet type.")
-	Unaccepted         = errors.New("Connection not accepted.")
-	connRefused        = errors.New("The remote station rejected the connection.")
-	recoveredRead      = errors.New("Reading error.")
+	// UnacceptableProtoV : Unacceptable protocol verion. It must always be '0x03'.
+	UnacceptableProtoV = errors.New("unacceptable protocol verion. Expected '0x03'")
+
+	// ClientIdRejected : Client-identifier rejected.
+	ClientIdRejected = errors.New("client-Id too long or too short")
+
+	// UnknownPacketType : Unknown packet type.
+	UnknownPacketType = errors.New("unknown packet type")
+
+	// Unaccepted : Connection not accepted.
+	Unaccepted = errors.New("connection not accepted")
+
+	connRefused   = errors.New("the remote station rejected the connection")
+	recoveredRead = errors.New("reading error")
 )
 
 func unknownPacketErr(mtype byte, state int) error {
-	return fmt.Errorf("Recieved a %s-packet while %s.", MessageTypes[mtype], States[state])
+	return fmt.Errorf("recieved a %s-packet while %s", MessageTypes[mtype], States[state])
 }
 
 func (client *Client) serveReader(reader io.Reader) {
 
 	for {
-		packet, err := Read(reader)
+		packet, _, err := Read(reader)
 
 		if err != nil {
 			client.Close(err)
@@ -358,6 +396,10 @@ func (client *Client) serveReader(reader io.Reader) {
 			return
 		}
 	}
+}
+
+func (client *Client) WritePacket(pkt Packet) (int, error) {
+	return client.Send(pkt)
 }
 
 func (client *Client) connect(pkt *ConnectPacket, w io.Writer) error {
