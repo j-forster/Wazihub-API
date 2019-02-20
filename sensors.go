@@ -39,3 +39,24 @@ func PostValue(deviceId string, sensorId string, value interface{}) error {
 	}
 	return nil
 }
+func PostValues(deviceId string, sensorId string, value interface{}) error {
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+
+	buf := bytes.NewBuffer(data)
+
+	resp, err := http.Post(Cloud+"devices/"+deviceId+"/sensors/"+sensorId+"/values", "application/json", buf)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("Recieved status %q:%q", resp.Status, body)
+	}
+	return nil
+}
