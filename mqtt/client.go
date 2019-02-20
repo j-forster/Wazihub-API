@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"github.com/j-forster/Wazihub-API/mqtt/tools"
 )
 
 type Closer interface {
@@ -68,6 +70,7 @@ var (
 
 func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, will *Message) (*Client, error) {
 
+	server := make(loopback)
 	client := &Client{
 		Id:      clientId,
 		pending: make(map[int]Packet),
@@ -77,7 +80,7 @@ func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, wi
 		// Server: &loopback{
 		// 	topics: NewTopic(nil, ""),
 		// },
-		Server:    make(loopback),
+		Server:    server,
 		subs:      make(map[string]*Subscription),
 		State:     StateConnecting,
 		sigServed: make(chan struct{}),
@@ -89,7 +92,7 @@ func Dial(addr string, clientId string, cleanSession bool, auth *ConnectAuth, wi
 		return nil, err
 	}
 	client.Context = context.Background()
-	client.Closer = conn
+	client.Closer = tools.MultiCloser(server, conn)
 
 	connect := Connect("MQIsdp", byte(0x03), cleanSession, 5000, clientId, will, auth)
 	connect.WriteTo(conn)
@@ -338,24 +341,24 @@ func (client *Client) Close(err error) {
 		client.Publish(nil, will)
 	}
 
-	if client.CleanSession || err == nil {
+	// if client.CleanSession || err == nil {
 
-		client.State = StateDisconnected
+	client.State = StateDisconnected
 
-		client.pktQueue.Flush()
-		client.cleanup()
+	client.pktQueue.Flush()
+	client.cleanup()
 
-		// close(client.queuePacket)
+	// close(client.queuePacket)
 
-		//<-client.sigServed
-		// must be closed after sigServed
-		// close(client.queueWriter)
+	//<-client.sigServed
+	// must be closed after sigServed
+	// close(client.queueWriter)
 
-	} else {
+	// } else {
 
-		client.State = StateSession
-		//client.queueWriter <- nil
-	}
+	//	client.State = StateSession
+	//client.queueWriter <- nil
+	//}
 }
 
 ////////////////////////////////////////////////////////////////////////////////

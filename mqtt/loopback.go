@@ -40,6 +40,11 @@ func (loop loopback) Subscribe(recv Reciever, topic string, qos byte) *Subscript
 func (loop loopback) Unsubscribe(subs *Subscription) {
 }
 
+func (loop loopback) Close() error {
+	close(loop)
+	return nil
+}
+
 /*
 type loopback struct {
 	topics *Topic

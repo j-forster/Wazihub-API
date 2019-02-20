@@ -7,7 +7,7 @@ import (
 )
 
 func init() {
-	os.Mkdir("session", 0644)
+	os.Mkdir("session", 0755)
 }
 
 // PacketWriter is a writer that accepts Packets.
@@ -20,11 +20,10 @@ type PacketWriter interface {
 type Queue struct {
 	id string // unique!
 
-	// writer, session, size, tail and sigFlushed are converd by the writeLock-mutex
-	writer  PacketWriter
-	session *os.File
-	size    int
-	tail    int
+	// writer, session, size and sigFlushed are converd by the writeLock-mutex
+	writer       PacketWriter
+	session      *os.File
+	size, offset int
 
 	sigFlushed chan error
 
@@ -33,7 +32,35 @@ type Queue struct {
 
 // NewQueue crates a new Packet-Queue that must be named uniquely with the id.
 func NewQueue(id string) *Queue {
-	return &Queue{id: id}
+	queue := &Queue{id: id}
+	session, err := os.OpenFile("session/"+id+".tmp", os.O_RDONLY, 0755)
+	if err == nil {
+		stat, _ := session.Stat()
+		queue.size = int(stat.Size())
+		buffer := make([]byte, 128)
+		offset := 0
+		for {
+			n, _ := session.Read(buffer)
+			if n == 0 { // empty or only-zero file
+				session.Close()
+				os.Remove("session/" + id + ".tmp")
+				queue.offset = 0
+				queue.size = 0
+				break
+			}
+			for i := 0; i < n; i++ {
+				if buffer[i] != 0 {
+					queue.offset = offset
+					queue.size -= offset
+					session.Close()
+					// log.Println("queue size", queue.size, "at", queue.offset)
+					return queue
+				}
+				offset++
+			}
+		}
+	}
+	return queue
 }
 
 // ServeWriter gives the queue a new writer.
@@ -45,23 +72,43 @@ func NewQueue(id string) *Queue {
 func (q *Queue) ServeWriter(w PacketWriter) error {
 
 	q.writeLock.Lock()
+
 	if q.size != 0 {
 		q.writeLock.Unlock()
 
-		session, err := os.OpenFile("session/"+q.id, os.O_RDONLY, 0644)
+		oldOffset := q.offset
+		session, err := os.OpenFile("session/"+q.id+".tmp", os.O_RDONLY, 0755)
 		if err != nil {
 			panic(err)
 		}
+		session.Seek(int64(q.offset), 0)
 		defer session.Close()
 
 		for {
 			pkt, n, err := Read(session)
-			if err != nil {
+			if n == 0 && err != nil {
 				panic(err)
 			}
+
 			d, err := w.WritePacket(pkt)
 			if err != nil {
-				session.Seek(int64(-n), 1)
+
+				diff := q.offset - oldOffset
+				if diff != 0 {
+					zeros := make([]byte, 64)
+					session.Close()
+					session, err = os.OpenFile("session/"+q.id+".tmp", os.O_WRONLY, 0755)
+					if err != nil {
+						panic(err)
+					}
+					session.Seek(int64(oldOffset), 0)
+					for oldOffset < q.offset {
+						session.Write(zeros[0:min(q.offset-oldOffset, 64)])
+						oldOffset += 64
+					}
+				}
+
+				//session.Seek(int64(q.offset), 0)
 
 				q.writeLock.Lock()
 				if q.sigFlushed != nil {
@@ -72,8 +119,14 @@ func (q *Queue) ServeWriter(w PacketWriter) error {
 				return err
 			}
 
+			if d != n {
+				panic("Queue read write mismatch")
+			}
+
 			q.writeLock.Lock()
 			q.size -= d
+			q.offset += d
+			// log.Printf("< %d %#v\n", q.size, pkt)
 			if q.size == 0 {
 				q.writer = w
 
@@ -81,6 +134,10 @@ func (q *Queue) ServeWriter(w PacketWriter) error {
 					q.sigFlushed <- nil
 					q.sigFlushed = nil
 				}
+
+				q.session.Close()
+				q.session = nil
+				os.Remove("session/" + q.id + ".tmp")
 
 				q.writeLock.Unlock()
 				return nil
@@ -101,14 +158,16 @@ func (q *Queue) ServeWriter(w PacketWriter) error {
 func (q *Queue) beginSession(pkt Packet) {
 
 	var err error
-	q.session, err = os.OpenFile("session/"+q.id, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	q.session, err = os.OpenFile("session/"+q.id+".tmp", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
 	if err != nil {
 		panic(err)
 	}
+	q.session.Seek(int64(q.offset), 0)
 	d, err := pkt.WriteTo(q.session)
 	if err != nil {
 		panic(err)
 	}
+	// log.Printf("> %d %#v\n", d, pkt)
 	q.size = d
 }
 
@@ -122,6 +181,7 @@ func (q *Queue) WritePacket(pkt Packet) (n int, err error) {
 
 		n, _ = pkt.WriteTo(q.session)
 		q.size += n
+		// log.Printf("> %d %#v\n", q.size, pkt)
 	} else {
 
 		if q.writer == nil {
@@ -166,4 +226,11 @@ func (q *Queue) Flush() (err error) {
 	// log.Println("flush?", id, size, writer)
 
 	return
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

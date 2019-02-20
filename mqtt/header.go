@@ -126,10 +126,10 @@ func (fh *FixedHeader) WriteTo(w io.Writer) (int, error) {
 
 	if fh.Length < 0x80 {
 		return w.Write([]byte{b, byte(fh.Length)})
-	} else if fh.Length < 0x8000 {
-		return w.Write([]byte{b, byte(fh.Length & 127), byte(fh.Length >> 7)})
-	} else if fh.Length < 0x8000 {
-		return w.Write([]byte{b, byte(fh.Length & 127), byte((fh.Length >> 7) & 127), byte(fh.Length >> 14)})
+	} else if fh.Length < 0x4000 {
+		return w.Write([]byte{b, byte(fh.Length&127) | 0x80, byte(fh.Length >> 7)})
+	} else if fh.Length < 0x200000 {
+		return w.Write([]byte{b, byte(fh.Length&127) | 0x80, byte((fh.Length>>7)&127) | 0x80, byte(fh.Length >> 14)})
 	}
 	return 0, MessageTooLong
 }

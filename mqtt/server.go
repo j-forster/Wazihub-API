@@ -235,7 +235,7 @@ func ListenAndServe(addr string, server Server) error {
 		return err
 	}
 
-	return serve(listener, server)
+	return Serve(listener, server)
 }
 
 func ListenAndServeTLS(addr string, config *tls.Config, server Server) error {
@@ -245,10 +245,10 @@ func ListenAndServeTLS(addr string, config *tls.Config, server Server) error {
 		return err
 	}
 
-	return serve(listener, server)
+	return Serve(listener, server)
 }
 
-func serve(listener net.Listener, server Server) error {
+func Serve(listener net.Listener, server Server) error {
 
 	if server == nil {
 		server = NewServer()
@@ -257,14 +257,14 @@ func serve(listener net.Listener, server Server) error {
 	for {
 		conn, err := listener.Accept()
 		if err == nil {
-			go Serve(conn, server)
+			go ServeConn(conn, server)
 		} else {
 			return err
 		}
 	}
 }
 
-func Serve(stream io.ReadWriteCloser, server Server) {
+func ServeConn(stream io.ReadWriteCloser, server Server) {
 
 	if server == nil {
 		server = NewServer()
